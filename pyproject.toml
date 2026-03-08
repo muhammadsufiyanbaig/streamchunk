@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "streamchunk"
-version = "2.0.0"
+version = "2.0.1"
 description = "Adaptive data stream chunker with CPU-aware parallel processing for real-time ETL pipelines"
 readme = "README.md"
 license = "MIT"
