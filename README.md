@@ -272,6 +272,36 @@ results = psc.run()
 print(psc.summary())
 ```
 
+### Parallel — weight-aware (variable-size rows)
+
+Use when rows have **uneven attribute sizes** — e.g. some rows contain large strings,
+nested dicts, or binary blobs. Without weight balancing, the worker that gets all
+the heavy rows becomes the bottleneck while the others sit idle.
+
+```python
+from streamchunk.parallel import ParallelStreamChunker
+
+# Rows with very different sizes
+data = [{"payload": fetch_variable_blob(i)} for i in range(10_000)]
+
+def process(chunk, meta):
+    store(chunk)
+
+psc = ParallelStreamChunker(
+    data=data,
+    processor=process,
+    mode="thread",
+    weight_fn=lambda row: len(row["payload"]),  # balance by payload length
+)
+
+results = psc.run()
+print(psc.summary())
+# {..., "weight_balanced": True}
+```
+
+`weight_fn` defaults to `sys.getsizeof` when not specified. Omit it entirely to
+keep the original count-based partitioning.
+
 ### Parallel — multiprocessing (CPU-bound)
 
 Best for: data transformation, ML inference, compression, encryption.
@@ -291,6 +321,38 @@ psc = ParallelStreamChunker(
 
 results = psc.run()
 print(psc.summary())
+```
+
+### Parallel file processing (CSV / JSONL)
+
+Process a large file across all CPU workers **without loading it into memory**.
+The file is split into N byte-range segments; each worker gets its own file handle
+and its own adaptive `StreamChunker`.
+
+```python
+from streamchunk.parallel import ParallelFileChunker
+
+def process(chunk, meta):
+    # chunk is a list of dicts for CSV, list of objects for JSONL
+    for row in chunk:
+        write_to_db(row)
+
+pfc = ParallelFileChunker(
+    path="large_data.csv",   # or .jsonl
+    processor=process,
+    format="csv",            # "csv" or "jsonl"
+    mode="thread",
+    n_workers=8,             # defaults to CPU topology
+    target_latency_ms=300,
+)
+
+results = pfc.run()
+print(pfc.summary())
+# {
+#   "file": "large_data.csv", "format": "csv",
+#   "n_workers": 8, "total_rows": 5_000_000,
+#   "avg_latency_ms": ..., "p95_latency_ms": ...
+# }
 ```
 
 ### Inspect CPU topology
@@ -425,6 +487,7 @@ ParallelStreamChunker(
     processor: Callable,       # processor(chunk, meta)
     mode: str = "thread",      # "thread" | "process"
     n_workers: int = None,     # defaults to CPU topology
+    weight_fn: Callable = None,# weight_fn(row) -> float — activates weight-aware partitioning
     **chunker_kwargs
 )
 ```
@@ -432,8 +495,29 @@ ParallelStreamChunker(
 | Method / Property | Description |
 |-------------------|-------------|
 | `psc.run()` | Partition and dispatch. Blocks until done. Returns per-worker stats. |
-| `psc.summary()` | Aggregated stats: total rows, latency p95, CPU info. |
+| `psc.summary()` | Aggregated stats: total rows, latency p95, CPU info, `weight_balanced` flag. |
 | `psc.cpu_info` | `{logical_threads, physical_cores, recommended_io, recommended_cpu}` |
+
+### `ParallelFileChunker`
+
+Processes a large CSV or JSONL file in parallel without loading it into memory.
+
+```python
+ParallelFileChunker(
+    path: str,                 # path to the file
+    processor: Callable,       # processor(chunk, meta)
+    format: str = "csv",       # "csv" | "jsonl"
+    mode: str = "thread",      # "thread" | "process"
+    n_workers: int = None,     # defaults to CPU topology
+    **chunker_kwargs
+)
+```
+
+| Method / Property | Description |
+|-------------------|-------------|
+| `pfc.run()` | Split file and dispatch. Blocks until done. Returns per-worker stats. |
+| `pfc.summary()` | Aggregated stats including `"file"`, `"format"`, total rows, latency p95. |
+| `pfc.cpu_info` | `{logical_threads, physical_cores, recommended_io, recommended_cpu}` |
 
 ### `ChunkMetadata`
 
@@ -481,6 +565,24 @@ chunker = StreamChunker.from_config("config.yaml", source=iter(data))
 ---
 
 ## Changelog
+
+### v2.1.0
+
+**Weight-aware partitioning** — fixes the "heavy partition bottleneck" where one worker stalls
+because it received rows with large attribute values while others finish instantly.
+
+- `partition_dataset_weighted(data, n, weight_fn)` — distributes rows by byte weight, not row count. Rows stay in original order. `weight_fn` defaults to `sys.getsizeof`.
+- `ParallelStreamChunker` gains a `weight_fn` parameter. Pass any callable to activate weight-aware splitting; omit it to keep the original count-based behaviour.
+- `summary()` now includes `"weight_balanced": bool` so you can confirm which mode was used.
+
+**Parallel file processing** — process large CSV and JSONL files across all CPU workers without loading the file into memory.
+
+- `ParallelFileChunker(path, processor, format, mode, n_workers, **chunker_kwargs)` — new top-level class. Splits the file into N byte-range segments (one per worker). Each worker opens its own file handle and runs its own adaptive `StreamChunker`.
+- `partition_file(path, n_partitions, format)` — new function in `partitioner.py`. Returns byte-range dicts suitable for `RangedFileSource`.
+- `RangedFileSource(path, start_byte, end_byte, format, headers, skip_partial_line)` — new source in `sources/file.py`. Uses binary seek so `tell()` positions are always accurate. Follows the Hadoop `TextInputFormat` convention: each worker skips one partial line at its start offset so no rows are ever duplicated or dropped.
+- `ParallelFileChunker.summary()` includes `"file"` and `"format"` keys alongside the standard throughput stats.
+
+32 new tests added; 71 total, all passing.
 
 ### v2.0.1
 - Added comprehensive impact analysis and benchmarks to documentation
